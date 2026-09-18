@@ -1,0 +1,2 @@
+# Agar.io Mobile Server uses Python standard libraries only
+# (socket, struct, threading, time, random, typing, logging, os, signal, sys)
