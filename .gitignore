@@ -10,6 +10,10 @@ __pycache__/
 *.keystore
 debug.keystore
 *_patched_src/
+apk_decoded/
+*.idsig
+*.png
+classes*.dex
 
 # Virtual Environments
 .venv/

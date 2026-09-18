@@ -118,10 +118,13 @@ class ProtobufMessage:
         return bytes(msg)
     
     @staticmethod
-    def encode_message(msg_type, payload):
-        """Encode a message with size header (16-bit big-endian)"""
+    def encode_message(msg_type, payload, use_32bit=False):
+        """Encode a message with size header (16-bit or 32-bit big-endian)"""
         size = len(payload) + 1  # +1 for type byte
-        header = struct.pack('>H', size)  # 16-bit big-endian
+        if use_32bit:
+            header = struct.pack('>I', size)
+        else:
+            header = struct.pack('>H', size)
         return header + bytes([msg_type]) + payload
 
 
@@ -137,27 +140,50 @@ class ClientConnection:
         self.connected = False
         self.logged_in = False
         self.in_game = False
+        self.use_32bit = None
         logger.info(f"[{self.addr}] New connection accepted")
     
     def send_message(self, msg_type, payload):
         """Send a protobuf message"""
         try:
-            msg = ProtobufMessage.encode_message(msg_type, payload)
+            use_32 = self.use_32bit if self.use_32bit is not None else False
+            msg = ProtobufMessage.encode_message(msg_type, payload, use_32bit=use_32)
             self.sock.sendall(msg)
-            logger.info(f"[{self.addr}] Sent message type {msg_type} ({len(payload)} bytes payload)")
+            logger.info(f"[{self.addr}] Sent message type {msg_type} ({len(payload)} bytes payload, 32bit={use_32})")
         except Exception as e:
             logger.error(f"[{self.addr}] Error sending message: {e}")
             self.close()
     
     def recv_message(self):
-        """Receive a protobuf message"""
+        """Receive a protobuf message (auto-detecting 16-bit vs 32-bit length header)"""
         try:
-            # Read 16-bit size header
-            size_header = self.sock.recv(2)
-            if len(size_header) < 2:
-                return None, None
-            
-            size = struct.unpack('>H', size_header)[0]
+            if self.use_32bit is None:
+                first_2 = self.sock.recv(2)
+                if len(first_2) < 2:
+                    return None, None
+                if first_2 == b'\x00\x00':
+                    # 32-bit header (Agar.io v2.28+)
+                    next_2 = self.sock.recv(2)
+                    if len(next_2) < 2:
+                        return None, None
+                    self.use_32bit = True
+                    size = struct.unpack('>I', first_2 + next_2)[0]
+                    logger.info(f"[{self.addr}] Detected 32-bit packet header format (v2.28+), size={size}")
+                else:
+                    self.use_32bit = False
+                    size = struct.unpack('>H', first_2)[0]
+                    logger.info(f"[{self.addr}] Detected 16-bit packet header format (v2.0), size={size}")
+            else:
+                if self.use_32bit:
+                    size_header = self.sock.recv(4)
+                    if len(size_header) < 4:
+                        return None, None
+                    size = struct.unpack('>I', size_header)[0]
+                else:
+                    size_header = self.sock.recv(2)
+                    if len(size_header) < 2:
+                        return None, None
+                    size = struct.unpack('>H', size_header)[0]
             
             # Read message type (1 byte) + payload
             msg_data = bytearray()
@@ -169,9 +195,12 @@ class ClientConnection:
                 msg_data.extend(chunk)
                 remaining -= len(chunk)
             
+            if not msg_data:
+                return None, None
+            
             msg_type = msg_data[0]
             payload = bytes(msg_data[1:])
-            logger.info(f"[{self.addr}] Received message type {msg_type} ({len(payload)} bytes payload)")
+            logger.info(f"[{self.addr}] Received message type {msg_type} ({len(payload)} bytes payload): hex={payload[:32].hex()}")
             return msg_type, payload
         except socket.timeout:
             return None, None
@@ -222,7 +251,13 @@ class ClientConnection:
                     break
                 
                 else:
-                    logger.warning(f"[{self.addr}] Unknown message type: {msg_type}")
+                    logger.warning(f"[{self.addr}] Unknown message type: {msg_type}, hex: {payload.hex()}")
+                    # Acknowledge or respond if needed
+                    # Try sending connect or login response as fallback
+                    if not self.connected:
+                        response = ProtobufMessage.build_connect_response(self.player_id, self.session_token)
+                        self.send_message(ProtobufMessage.CONNECT_RESPONSE, response)
+                        self.connected = True
         
         except Exception as e:
             logger.error(f"[{self.addr}] Exception in handle: {e}")
@@ -230,10 +265,10 @@ class ClientConnection:
             self.close()
     
     def send_keepalive(self):
-        """Send a keep-alive message (simple empty message)"""
+        """Send a keep-alive message"""
         try:
-            # Send a simple ping/keep-alive (could be any low message type)
-            msg = ProtobufMessage.encode_message(99, b'')
+            use_32 = self.use_32bit if self.use_32bit is not None else False
+            msg = ProtobufMessage.encode_message(99, b'', use_32bit=use_32)
             self.sock.sendall(msg)
             logger.info(f"[{self.addr}] Sent keep-alive")
         except:
