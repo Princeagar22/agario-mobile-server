@@ -118,6 +118,67 @@ class ProtobufMessage:
         return bytes(msg)
     
     @staticmethod
+    def encode_tag(field_num, wire_type):
+        """Encode a protobuf tag"""
+        return ProtobufMessage.encode_varint((field_num << 3) | wire_type)
+
+    @staticmethod
+    def parse_fields(data):
+        """Parse raw protobuf wire bytes into a dict of field_number -> value"""
+        fields = {}
+        i = 0
+        while i < len(data):
+            tag = 0; shift = 0
+            while True:
+                if i >= len(data): break
+                b = data[i]; i += 1
+                tag |= (b & 0x7f) << shift
+                if not (b & 0x80): break
+                shift += 7
+            f_num = tag >> 3
+            w_type = tag & 0x7
+            if w_type == 0:
+                val = 0; shift = 0
+                while True:
+                    if i >= len(data): break
+                    b = data[i]; i += 1
+                    val |= (b & 0x7f) << shift
+                    if not (b & 0x80): break
+                    shift += 7
+                fields[f_num] = val
+            elif w_type == 2:
+                l = 0; shift = 0
+                while True:
+                    if i >= len(data): break
+                    b = data[i]; i += 1
+                    l |= (b & 0x7f) << shift
+                    if not (b & 0x80): break
+                    shift += 7
+                fields[f_num] = data[i:i+l]
+                i += l
+            elif w_type == 5:
+                i += 4
+            elif w_type == 1:
+                i += 8
+            else:
+                break
+        return fields
+
+    @staticmethod
+    def build_envelope_response(submsg_field, submsg_payload, req_id=None, channel=2):
+        """Build an Agar.io v2.28+ Envelope containing a req message"""
+        req = bytearray()
+        req += ProtobufMessage.encode_tag(submsg_field, 2) + ProtobufMessage.encode_varint(len(submsg_payload)) + submsg_payload
+        if req_id is not None:
+            req += ProtobufMessage.encode_tag(76, 0) + ProtobufMessage.encode_varint(req_id)
+        
+        env = bytearray()
+        env += ProtobufMessage.encode_tag(2, 2) + ProtobufMessage.encode_varint(len(req)) + req
+        env += ProtobufMessage.encode_tag(4, 0) + ProtobufMessage.encode_varint(channel)
+        
+        return struct.pack('>I', len(env)) + env
+
+    @staticmethod
     def encode_message(msg_type, payload, use_32bit=False):
         """Encode a message with size header (16-bit or 32-bit big-endian)"""
         size = len(payload) + 1  # +1 for type byte
@@ -220,6 +281,12 @@ class ClientConnection:
                     logger.info(f"[{self.addr}] Client disconnected or timeout")
                     break
                 
+                if msg_type == 18:
+                    # Agar.io v2.28+ Protobuf Envelope
+                    full_env = bytes([msg_type]) + payload
+                    self.handle_v25_envelope(full_env)
+                    continue
+
                 if msg_type == ProtobufMessage.CONNECT_REQUEST:
                     logger.info(f"[{self.addr}] CONNECT_REQUEST received")
                     response = ProtobufMessage.build_connect_response(
@@ -252,17 +319,57 @@ class ClientConnection:
                 
                 else:
                     logger.warning(f"[{self.addr}] Unknown message type: {msg_type}, hex: {payload.hex()}")
-                    # Acknowledge or respond if needed
-                    # Try sending connect or login response as fallback
-                    if not self.connected:
-                        response = ProtobufMessage.build_connect_response(self.player_id, self.session_token)
-                        self.send_message(ProtobufMessage.CONNECT_RESPONSE, response)
-                        self.connected = True
         
         except Exception as e:
             logger.error(f"[{self.addr}] Exception in handle: {e}")
         finally:
             self.close()
+    
+    def handle_v25_envelope(self, envelope_bytes):
+        """Handle Agar.io v2.28+ protobuf envelope"""
+        try:
+            env = ProtobufMessage.parse_fields(envelope_bytes)
+            req_bytes = env.get(2)
+            channel = env.get(4, 2)
+            if not req_bytes:
+                return
+            
+            req = ProtobufMessage.parse_fields(req_bytes)
+            req_id = req.get(76)
+            logger.info(f"[{self.addr}] [V25 REQ] req_id={req_id}, fields={list(req.keys())}")
+            
+            # Field 20: connect_request
+            if 20 in req:
+                logger.info(f"[{self.addr}] [V25] Handshake CONNECT_REQUEST received (req_id={req_id})")
+                cr_payload = ProtobufMessage.build_connect_response(self.player_id, self.session_token)
+                resp = ProtobufMessage.build_envelope_response(33, cr_payload, req_id=req_id, channel=channel)
+                self.sock.sendall(resp)
+                self.connected = True
+                logger.info(f"[{self.addr}] [V25] Sent CONNECT_RESPONSE (Type 33, req_id={req_id})")
+            
+            # Field 87: early handshake / token update
+            elif 87 in req:
+                logger.info(f"[{self.addr}] [V25] Field 87 token update received (req_id={req_id})")
+                resp = ProtobufMessage.build_envelope_response(101, b'', req_id=req_id, channel=channel)
+                self.sock.sendall(resp)
+                logger.info(f"[{self.addr}] [V25] Acknowledged Field 87 (Type 101, req_id={req_id})")
+            
+            # Login or game requests
+            elif any(f in req for f in [3, 21, 23, 24, 26]):
+                logger.info(f"[{self.addr}] [V25] LOGIN_REQUEST received (req_id={req_id})")
+                login_payload = ProtobufMessage.build_login_response(self.player_id, self.player_name, status=0)
+                resp = ProtobufMessage.build_envelope_response(118, login_payload, req_id=req_id, channel=channel)
+                self.sock.sendall(resp)
+                self.logged_in = True
+                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118, req_id={req_id})")
+            
+            else:
+                logger.info(f"[{self.addr}] [V25] Other request with fields {list(req.keys())}")
+                if req_id is not None:
+                    resp = ProtobufMessage.build_envelope_response(107, b'', req_id=req_id, channel=channel)
+                    self.sock.sendall(resp)
+        except Exception as e:
+            logger.error(f"[{self.addr}] Error handling v25 envelope: {e}")
     
     def send_keepalive(self):
         """Send a keep-alive message"""
