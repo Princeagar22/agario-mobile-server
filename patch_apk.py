@@ -1,173 +1,102 @@
 #!/usr/bin/env python3
 """
-Patch Agar.io v2.0.3 APK to connect to custom localhost server
+Patch Agar.io v2.0.3 APK to connect to custom server endpoint (e.g. Railway TCP Proxy)
+Directly patches libgame.so and re-signs APK without requiring apktool.
 """
 
-import struct
 import os
-import subprocess
 import sys
+import zipfile
+import subprocess
 
-def patch_binary(binary_path, old_host, new_host, old_port, new_port):
-    """
-    Patch the binary to replace server endpoint
-    """
-    with open(binary_path, 'rb') as f:
-        data = f.read()
-    
-    original_size = len(data)
-    
-    # Find and replace the old host
-    old_host_bytes = old_host.encode('utf-8')
-    new_host_bytes = new_host.encode('utf-8')
-    
-    # Ensure new host is same length or shorter (pad with nulls if needed)
-    if len(new_host_bytes) > len(old_host_bytes):
-        print(f"ERROR: New host '{new_host}' ({len(new_host_bytes)} bytes) is longer than old host '{old_host}' ({len(old_host_bytes)} bytes)")
+def patch_apk(apk_path, new_host='reseau.proxy.rlwy.net', new_port=33266, output_apk=None):
+    if not os.path.exists(apk_path):
+        print(f"[ERROR] APK not found: {apk_path}")
         return False
-    
-    # Pad new host to same length
-    new_host_bytes = new_host_bytes.ljust(len(old_host_bytes), b'\x00')
-    
-    count = data.count(old_host_bytes)
-    print(f"Found {count} occurrences of '{old_host}'")
-    
-    if count > 0:
-        data = data.replace(old_host_bytes, new_host_bytes)
-        print(f"Replaced all occurrences of '{old_host}' with '{new_host}'")
-    
-    # Also try to find port number in network byte order
-    # Port 9000 = 0x2328 (big-endian)
-    # We'll search for the ASCII string as well
-    old_port_str = str(old_port).encode('utf-8')
+
+    work_dir = os.path.dirname(os.path.abspath(apk_path))
+    if not output_apk:
+        base_name = os.path.basename(apk_path).replace('.apk', '')
+        output_apk = os.path.join(work_dir, f"{base_name}_railway.apk")
+
+    print(f"\n[1] Patching APK: {apk_path}")
+    print(f"    Target Server: {new_host}:{new_port}")
+    print(f"    Output File:   {output_apk}")
+
+    old_host_slot_len = 40  # 39 char host + 1 null terminator
+    new_host_bytes = new_host.encode('utf-8').ljust(old_host_slot_len, b'\x00')
+    if len(new_host_bytes) > old_host_slot_len:
+        print(f"[ERROR] New host '{new_host}' is too long (max 39 characters).")
+        return False
+
     new_port_str = str(new_port).encode('utf-8')
-    
-    if len(new_port_str) <= len(old_port_str):
-        new_port_str = new_port_str.ljust(len(old_port_str), b'\x00')
-        count = data.count(old_port_str)
-        if count > 0:
-            print(f"Found {count} occurrences of port '{old_port}'")
-            data = data.replace(old_port_str, new_port_str)
-            print(f"Replaced all occurrences of port '{old_port}' with '{new_port}'")
-    
-    with open(binary_path, 'wb') as f:
-        f.write(data)
-    
-    print(f"Patched binary: {binary_path} ({original_size} bytes)")
-    return True
 
-
-def patch_apk(apk_path, new_host='127.0.0.1', new_port=9000):
-    """
-    Extract, patch, rebuild, and sign APK
-    """
-    work_dir = os.path.dirname(apk_path)
-    base_name = os.path.basename(apk_path).replace('.apk', '')
-    
-    # Decompile
-    print("\n[1] Decompiling APK with apktool...")
-    apktool_path = os.path.join(work_dir, 'apktool.jar')
-    if not os.path.exists(apktool_path):
-        apktool_path = '/workspace/work/apktool.jar'
-    decompile_dir = os.path.join(work_dir, f'{base_name}_patched_src')
-    
-    if os.path.exists(decompile_dir):
-        import shutil
-        shutil.rmtree(decompile_dir)
-    
-    result = subprocess.run([
-        'java', '-jar', apktool_path, 'd', '-f', apk_path, '-o', decompile_dir
-    ], capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"ERROR: apktool decompile failed: {result.stderr}")
-        return False
-    
-    print(f"Decompiled to: {decompile_dir}")
-    
-    # Patch libgame.so
-    print("\n[2] Patching libgame.so...")
-    libgame_paths = [
-        os.path.join(decompile_dir, 'lib', 'armeabi-v7a', 'libgame.so'),
-        os.path.join(decompile_dir, 'lib', 'arm64-v8a', 'libgame.so'),
-    ]
-    
-    for libgame_path in libgame_paths:
-        if os.path.exists(libgame_path):
-            print(f"Patching: {libgame_path}")
-            # Old endpoints from v2.0.3
-            patch_binary(libgame_path, 
-                        'mobile-live-v10-0.agario.miniclippt.com',
-                        'localhost\x00\x00\x00\x00\x00\x00\x00\x00\x00',
-                        9000, 9000)
+    with zipfile.ZipFile(apk_path, 'r') as zin, zipfile.ZipFile(output_apk, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            # Skip old signature files
+            if item.filename.startswith('META-INF/'):
+                continue
             
-            # Also patch config URL to localhost (if we want to host config locally)
-            # For now we'll keep the config URL as-is, or redirect it
-            patch_binary(libgame_path,
-                        'https://configs.agario.miniclippt.com/live/v10',
-                        'http://localhost:8888/config\x00',
-                        0, 0)
-    
-    # Rebuild APK
-    print("\n[3] Rebuilding APK...")
-    output_apk = os.path.join(work_dir, f'{base_name}_patched.apk')
-    
-    result = subprocess.run([
-        'java', '-jar', apktool_path, 'b', decompile_dir, '-o', output_apk
-    ], capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"ERROR: apktool build failed: {result.stderr}")
-        return False
-    
-    print(f"Built APK: {output_apk}")
-    
-    # Create debug signing key if doesn't exist
-    print("\n[4] Signing APK...")
+            data = zin.read(item.filename)
+            
+            if 'libgame.so' in item.filename:
+                print(f"    Patching native binary: {item.filename}...")
+                # Search for serverHost key
+                host_key = b'serverHost\x00'
+                port_key = b'serverPort\x00'
+                
+                h_idx = data.find(host_key)
+                p_idx = data.find(port_key)
+                
+                if h_idx != -1 and p_idx != -1:
+                    # Replace 40-byte host slot
+                    host_start = h_idx + len(host_key)
+                    data = data[:host_start] + new_host_bytes + data[host_start + old_host_slot_len:]
+                    
+                    # Update port slot
+                    p_idx_new = data.find(port_key)
+                    port_start = p_idx_new + len(port_key)
+                    # Port slot is 5 bytes (e.g. 9000\x00 or 33266)
+                    port_slot_len = 5
+                    data = data[:port_start] + new_port_str[:port_slot_len].ljust(port_slot_len, b'\x00') + data[port_start + port_slot_len:]
+                    print(f"    [OK] Successfully replaced endpoint with {new_host}:{new_port}")
+                else:
+                    print(f"    [WARN] serverHost/serverPort keys not found in {item.filename}")
+            
+            zout.writestr(item, data)
+
+    print(f"\n[2] Signing APK...")
     keystore_path = os.path.join(work_dir, 'debug.keystore')
-    
     if not os.path.exists(keystore_path):
-        print("Creating debug keystore...")
-        result = subprocess.run([
+        print("    Creating debug keystore...")
+        subprocess.run([
             'keytool', '-genkey', '-v', '-keystore', keystore_path,
             '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000',
             '-alias', 'debug', '-storepass', 'android', '-keypass', 'android',
             '-dname', 'CN=Debug,O=Debug,L=Debug,S=Debug,C=US'
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"ERROR: keytool failed: {result.stderr}")
-            return False
-    
-    # Sign with jarsigner
-    result = subprocess.run([
+        ], check=True, stdout=subprocess.DEVNULL)
+
+    sign_res = subprocess.run([
         'jarsigner', '-verbose', '-sigalg', 'SHA1withRSA', '-digestalg', 'SHA1',
         '-keystore', keystore_path, '-storepass', 'android', '-keypass', 'android',
         output_apk, 'debug'
     ], capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"WARNING: jarsigner returned code {result.returncode}: {result.stderr}")
-        # Some versions of jarsigner may return non-zero even on success
-    
-    print(f"Signed APK: {output_apk}")
-    
-    print(f"\n✓ Patched APK ready: {output_apk}")
-    return True
 
+    if sign_res.returncode != 0:
+        print(f"    [WARN] jarsigner exit code {sign_res.returncode}")
+
+    print(f"\n✓ Patched & Signed APK ready: {output_apk}")
+    return True
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python3 patch_apk.py <apk_path> [new_host] [new_port]")
-        sys.exit(1)
-    
-    apk_path = sys.argv[1]
-    new_host = sys.argv[2] if len(sys.argv) > 2 else 'localhost'
-    new_port = int(sys.argv[3]) if len(sys.argv) > 3 else 9000
-    
-    if not os.path.exists(apk_path):
-        print(f"ERROR: APK not found: {apk_path}")
-        sys.exit(1)
-    
-    success = patch_apk(apk_path, new_host, new_port)
-    sys.exit(0 if success else 1)
+        apk_default = "agar.io_2.0.3_androidapksbox_patched (1).apk"
+        host_default = "reseau.proxy.rlwy.net"
+        port_default = 33266
+        print(f"Using defaults: {apk_default} -> {host_default}:{port_default}")
+        patch_apk(apk_default, host_default, port_default)
+    else:
+        apk_path = sys.argv[1]
+        host = sys.argv[2] if len(sys.argv) > 2 else "reseau.proxy.rlwy.net"
+        port = int(sys.argv[3]) if len(sys.argv) > 3 else 33266
+        patch_apk(apk_path, host, port)
