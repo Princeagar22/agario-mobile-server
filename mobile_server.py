@@ -208,11 +208,59 @@ class ProtobufMessage:
         return struct.pack('>I', len(env)) + env
 
     @staticmethod
-    def build_v25_login_response(status=1):
-        """Build Agar.io v2.28+ login_response (Type 118, Field 8, status varint = 1 for success)"""
+    def build_v25_user_info(account_id=12345, name="Guest"):
+        """Build user_info protobuf message (Field 11 in login_response)"""
         msg = bytearray()
-        # Field 1: status (varint enum: 1-16, 1 = SUCCESS)
-        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(status)
+        # Field 1: account_id (varint)
+        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(account_id)
+        # Field 2: name (string)
+        msg += ProtobufMessage.encode_tag(2, 2) + ProtobufMessage.encode_string(name)
+        # Field 3: level (varint)
+        msg += ProtobufMessage.encode_tag(3, 0) + ProtobufMessage.encode_varint(1)
+        # Field 4: xp (varint)
+        msg += ProtobufMessage.encode_tag(4, 0) + ProtobufMessage.encode_varint(0)
+        # Field 5: next_level_xp (varint)
+        msg += ProtobufMessage.encode_tag(5, 0) + ProtobufMessage.encode_varint(100)
+        # Field 6: country (string)
+        msg += ProtobufMessage.encode_tag(6, 2) + ProtobufMessage.encode_string("US")
+        return bytes(msg)
+
+    @staticmethod
+    def build_v25_user_stats():
+        """Build user_stats protobuf message (Field 12 in login_response)"""
+        msg = bytearray()
+        # Field 1: games_played (varint)
+        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(0)
+        # Field 2: highest_mass (varint)
+        msg += ProtobufMessage.encode_tag(2, 0) + ProtobufMessage.encode_varint(0)
+        # Field 3: total_mass (varint)
+        msg += ProtobufMessage.encode_tag(3, 0) + ProtobufMessage.encode_varint(0)
+        # Field 4: cells_eaten (varint)
+        msg += ProtobufMessage.encode_tag(4, 0) + ProtobufMessage.encode_varint(0)
+        return bytes(msg)
+
+    @staticmethod
+    def build_v25_login_response(account_id=12345, name="Guest", host="reseau.proxy.rlwy.net", port=33266, token="token123"):
+        """Build Agar.io v2.28+ login_response (Type 118, Field 8 in req)
+        Contains:
+          - Field 10: status = 1 (SUCCESS)
+          - Field 11: user_info
+          - Field 12: user_stats
+          - Field 14: server_info
+        """
+        u_info = ProtobufMessage.build_v25_user_info(account_id=account_id, name=name)
+        s_info = ProtobufMessage.build_v25_server_info(host=host, port=port, token=token)
+        u_stats = ProtobufMessage.build_v25_user_stats()
+
+        msg = bytearray()
+        # Field 10: status = 1 (SUCCESS)
+        msg += ProtobufMessage.encode_tag(10, 0) + ProtobufMessage.encode_varint(1)
+        # Field 11: user_info (wire 2)
+        msg += ProtobufMessage.encode_tag(11, 2) + ProtobufMessage.encode_varint(len(u_info)) + u_info
+        # Field 12: user_stats (wire 2)
+        msg += ProtobufMessage.encode_tag(12, 2) + ProtobufMessage.encode_varint(len(u_stats)) + u_stats
+        # Field 14: server_info (wire 2)
+        msg += ProtobufMessage.encode_tag(14, 2) + ProtobufMessage.encode_varint(len(s_info)) + s_info
         return bytes(msg)
 
 
@@ -432,6 +480,21 @@ class ClientConnection:
                 self.connected = True
                 logger.info(f"[{self.addr}] [V25] Sent CONNECT_RESPONSE (Type 33)")
                 
+                # Send LOGIN_RESPONSE with full user_info and server_info
+                login_payload = ProtobufMessage.build_v25_login_response(
+                    account_id=self.player_id, name=self.player_name, host="reseau.proxy.rlwy.net", port=33266, token=self.session_token
+                )
+                resp_login = ProtobufMessage.build_envelope_response(118, login_payload, channel=channel)
+                self.sock.sendall(resp_login)
+                self.logged_in = True
+                logger.info(f"[{self.addr}] [V25] Sent rich LOGIN_RESPONSE (Type 118)")
+                
+                # Send DEVICE_TOKEN_UPDATE
+                dt_payload = ProtobufMessage.build_v25_device_token_update(token="token_" + str(self.player_id))
+                resp_dt = ProtobufMessage.build_envelope_response(101, dt_payload, channel=channel)
+                self.sock.sendall(resp_dt)
+                logger.info(f"[{self.addr}] [V25] Sent DEVICE_TOKEN_UPDATE (Type 101)")
+
                 # Send Server PING (Type 90) to trigger client's onConnection handler!
                 ping_packet = ProtobufMessage.build_v25_ping(channel=channel)
                 self.sock.sendall(ping_packet)
@@ -440,11 +503,18 @@ class ClientConnection:
             # Field 1 or req_id 107: client replied with pong
             elif 1 in req or req_id == 107:
                 logger.info(f"[{self.addr}] [V25] Client PONG (Type 107) received!")
-                login_payload = ProtobufMessage.build_v25_login_response(status=1)
+                login_payload = ProtobufMessage.build_v25_login_response(
+                    account_id=self.player_id, name=self.player_name, host="reseau.proxy.rlwy.net", port=33266, token=self.session_token
+                )
                 resp = ProtobufMessage.build_envelope_response(118, login_payload, channel=channel)
                 self.sock.sendall(resp)
                 self.logged_in = True
-                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118, Field 8)")
+                logger.info(f"[{self.addr}] [V25] Sent rich LOGIN_RESPONSE on PONG (Type 118, Field 8)")
+                
+                dt_payload = ProtobufMessage.build_v25_device_token_update(token="token_" + str(self.player_id))
+                resp_dt = ProtobufMessage.build_envelope_response(101, dt_payload, channel=channel)
+                self.sock.sendall(resp_dt)
+                logger.info(f"[{self.addr}] [V25] Sent DEVICE_TOKEN_UPDATE on PONG (Type 101)")
             
             # Field 87 or 90: ping -> reply with pong (Type 107)
             elif 87 in req or 90 in req or req_id == 90:
@@ -457,11 +527,13 @@ class ClientConnection:
             # Login or game requests
             elif any(f in req for f in [3, 21, 23, 24, 26, 75]):
                 logger.info(f"[{self.addr}] [V25] LOGIN_REQUEST received (req_id={req_id})")
-                login_payload = ProtobufMessage.build_v25_login_response(status=0)
+                login_payload = ProtobufMessage.build_v25_login_response(
+                    account_id=self.player_id, name=self.player_name, host="reseau.proxy.rlwy.net", port=33266, token=self.session_token
+                )
                 resp = ProtobufMessage.build_envelope_response(118, login_payload, channel=channel)
                 self.sock.sendall(resp)
                 self.logged_in = True
-                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118)")
+                logger.info(f"[{self.addr}] [V25] Sent rich LOGIN_RESPONSE (Type 118)")
 
             
             else:
