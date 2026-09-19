@@ -243,26 +243,11 @@ class ProtobufMessage:
     def build_v25_login_response(account_id=12345, name="Guest", host="reseau.proxy.rlwy.net", port=33266, token="token123"):
         """Build Agar.io v2.28+ login_response (Type 118, Field 8 in req)
         Contains:
-          - Field 10: status = 1 (SUCCESS)
-          - Field 11: user_info
-          - Field 12: user_stats
-          - Field 14: server_info
+          - Field 1: status = 1 (SUCCESS) [REQUIRED by login_response::MergePartialFromCodedStream at 0x16b7838]
         """
-        u_info = ProtobufMessage.build_v25_user_info(account_id=account_id, name=name)
-        s_info = ProtobufMessage.build_v25_server_info(host=host, port=port, token=token)
-        u_stats = ProtobufMessage.build_v25_user_stats()
-
         msg = bytearray()
-        # Field 10: status = 1 (SUCCESS)
-        msg += ProtobufMessage.encode_tag(10, 0) + ProtobufMessage.encode_varint(1)
-        # Field 11: user_info (wire 2)
-        msg += ProtobufMessage.encode_tag(11, 2) + ProtobufMessage.encode_varint(len(u_info)) + u_info
-        # Field 12: user_stats (wire 2)
-        msg += ProtobufMessage.encode_tag(12, 2) + ProtobufMessage.encode_varint(len(u_stats)) + u_stats
-        # Field 14: server_info (wire 2)
-        msg += ProtobufMessage.encode_tag(14, 2) + ProtobufMessage.encode_varint(len(s_info)) + s_info
-        # Field 24: required string token (sets bit 0 in has_bits, REQUIRED by req::IsInitialized at 0x1702714!)
-        msg += ProtobufMessage.encode_tag(24, 2) + ProtobufMessage.encode_string(token)
+        # Field 1: status = 1 (SUCCESS) - REQUIRED
+        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(1)
         return bytes(msg)
 
 
