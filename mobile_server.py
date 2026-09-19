@@ -261,6 +261,8 @@ class ProtobufMessage:
         msg += ProtobufMessage.encode_tag(12, 2) + ProtobufMessage.encode_varint(len(u_stats)) + u_stats
         # Field 14: server_info (wire 2)
         msg += ProtobufMessage.encode_tag(14, 2) + ProtobufMessage.encode_varint(len(s_info)) + s_info
+        # Field 24: required string token (sets bit 0 in has_bits, REQUIRED by req::IsInitialized at 0x1702714!)
+        msg += ProtobufMessage.encode_tag(24, 2) + ProtobufMessage.encode_string(token)
         return bytes(msg)
 
 
