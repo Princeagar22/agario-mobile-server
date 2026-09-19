@@ -85,6 +85,37 @@ class ProtobufMessage:
         return bytes(msg)
     
     @staticmethod
+    def build_v25_server_info(host="reseau.proxy.rlwy.net", port=33266, token="token123"):
+        """Build server_info protobuf message (required fields 1, 2, 3, 4, 5)"""
+        msg = bytearray()
+        # Field 1: server_id / type (varint)
+        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(1)
+        # Field 2: host (string)
+        msg += ProtobufMessage.encode_tag(2, 2) + ProtobufMessage.encode_string(host)
+        # Field 3: port (varint)
+        msg += ProtobufMessage.encode_tag(3, 0) + ProtobufMessage.encode_varint(port)
+        # Field 4: token / country (string)
+        msg += ProtobufMessage.encode_tag(4, 2) + ProtobufMessage.encode_string(token)
+        # Field 5: status / ssl / type (varint - REQUIRED for 0x1f mask check at 0xcb7218!)
+        msg += ProtobufMessage.encode_tag(5, 0) + ProtobufMessage.encode_varint(1)
+        return bytes(msg)
+
+    @staticmethod
+    def build_v25_connect_response(host="reseau.proxy.rlwy.net", port=9000, token="token123"):
+        """Build Agar.io v2.28+ connect_response (Type 33, containing server_info)"""
+        si = ProtobufMessage.build_v25_server_info(host=host, port=port, token=token)
+        msg = bytearray()
+        msg += ProtobufMessage.encode_tag(1, 2) + ProtobufMessage.encode_varint(len(si)) + si
+        return bytes(msg)
+
+    @staticmethod
+    def build_v25_device_token_update(token="token_ok"):
+        """Build Agar.io v2.28+ device_token_update (Type 101, containing required string token)"""
+        msg = bytearray()
+        msg += ProtobufMessage.encode_tag(1, 2) + ProtobufMessage.encode_string(token)
+        return bytes(msg)
+
+    @staticmethod
     def build_login_response(player_id=12345, player_name="Guest", status=0):
         """Build a LOGIN_RESPONSE message"""
         # message login_response {
@@ -165,18 +196,54 @@ class ProtobufMessage:
         return fields
 
     @staticmethod
-    def build_envelope_response(submsg_field, submsg_payload, req_id=None, channel=2):
-        """Build an Agar.io v2.28+ Envelope containing a req message"""
+    def build_v25_ping(channel=2):
+        """Build Agar.io v2.28+ server ping envelope (req_type_enum 90)"""
+        ping_submsg = ProtobufMessage.encode_tag(2, 0) + ProtobufMessage.encode_varint(0)
         req = bytearray()
-        req += ProtobufMessage.encode_tag(submsg_field, 2) + ProtobufMessage.encode_varint(len(submsg_payload)) + submsg_payload
-        if req_id is not None:
-            req += ProtobufMessage.encode_tag(76, 0) + ProtobufMessage.encode_varint(req_id)
+        req += ProtobufMessage.encode_tag(87, 2) + ProtobufMessage.encode_varint(len(ping_submsg)) + ping_submsg
+        req += ProtobufMessage.encode_tag(76, 0) + ProtobufMessage.encode_varint(90)
+        env = bytearray()
+        env += ProtobufMessage.encode_tag(2, 2) + ProtobufMessage.encode_varint(len(req)) + req
+        env += ProtobufMessage.encode_tag(4, 0) + ProtobufMessage.encode_varint(channel)
+        return struct.pack('>I', len(env)) + env
+
+    @staticmethod
+    def build_v25_login_response(status=1):
+        """Build Agar.io v2.28+ login_response (Type 118, Field 8, status varint = 1 for success)"""
+        msg = bytearray()
+        # Field 1: status (varint enum: 1-16, 1 = SUCCESS)
+        msg += ProtobufMessage.encode_tag(1, 0) + ProtobufMessage.encode_varint(status)
+        return bytes(msg)
+
+
+    @staticmethod
+    def build_envelope_response(submsg_field, submsg_payload, channel=2):
+        """Build an Agar.io v2.28+ Envelope containing a req message"""
+        # Map req_type_enum to the exact field number in agario.proto.req:
+        # Type 107 (pong) -> Field 1 (sets bit 0, inlined in req::IsInitialized at 0xcc5734)
+        # Type 33 (connect_response) -> Field 10 (sets bit 9, checked in req::IsInitialized at 0xcc6050)
+        # Type 118 (login_response) -> Field 8 (sets bit 7, verified in ByteSizeLong at 0xc78c68)
+        type_to_req_field = {
+            107: 1,   # pong
+            33: 10,   # connect_response
+            118: 8,   # login_response
+            101: 45,  # device_token_update
+            50: 54,   # configuration_change
+            114: 56,  # game_enter_response
+        }
+        req_field = type_to_req_field.get(submsg_field, submsg_field)
+        
+        req = bytearray()
+        req += ProtobufMessage.encode_tag(req_field, 2) + ProtobufMessage.encode_varint(len(submsg_payload)) + submsg_payload
+        # Field 76: req_type_enum discriminator (REQUIRED by req::IsInitialized at 0xcc5714!)
+        req += ProtobufMessage.encode_tag(76, 0) + ProtobufMessage.encode_varint(submsg_field)
         
         env = bytearray()
         env += ProtobufMessage.encode_tag(2, 2) + ProtobufMessage.encode_varint(len(req)) + req
         env += ProtobufMessage.encode_tag(4, 0) + ProtobufMessage.encode_varint(channel)
         
         return struct.pack('>I', len(env)) + env
+
 
     @staticmethod
     def encode_message(msg_type, payload, use_32bit=False):
@@ -199,10 +266,26 @@ class ClientConnection:
         self.session_token = f"session_{self.player_id}_{int(time.time())}"
         self.player_name = "Guest"
         self.connected = False
-        self.logged_in = False
-        self.in_game = False
+        self.running = True
         self.use_32bit = None
+        self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self.keepalive_thread.start()
         logger.info(f"[{self.addr}] New connection accepted")
+    
+    def _keepalive_loop(self):
+        """Send periodic pings for v2.28+ connections to keep session active"""
+        while self.running:
+            time.sleep(5)
+            if not self.running:
+                break
+            if self.connected and self.use_32bit:
+                try:
+                    ping_packet = ProtobufMessage.build_v25_ping(channel=2)
+                    self.sock.sendall(ping_packet)
+                    logger.debug(f"[{self.addr}] [V25] Sent periodic ping")
+                except:
+                    break
+
     
     def send_message(self, msg_type, payload):
         """Send a protobuf message"""
@@ -341,33 +424,56 @@ class ClientConnection:
             # Field 20: connect_request
             if 20 in req:
                 logger.info(f"[{self.addr}] [V25] Handshake CONNECT_REQUEST received (req_id={req_id})")
-                cr_payload = ProtobufMessage.build_connect_response(self.player_id, self.session_token)
-                resp = ProtobufMessage.build_envelope_response(33, cr_payload, req_id=req_id, channel=channel)
+                cr_payload = ProtobufMessage.build_v25_connect_response(
+                    host="reseau.proxy.rlwy.net", port=33266, token=self.session_token
+                )
+                resp = ProtobufMessage.build_envelope_response(33, cr_payload, channel=channel)
                 self.sock.sendall(resp)
                 self.connected = True
-                logger.info(f"[{self.addr}] [V25] Sent CONNECT_RESPONSE (Type 33, req_id={req_id})")
+                logger.info(f"[{self.addr}] [V25] Sent CONNECT_RESPONSE (Type 33)")
+                
+                # Send Server PING (Type 90) to trigger client's onConnection handler!
+                ping_packet = ProtobufMessage.build_v25_ping(channel=channel)
+                self.sock.sendall(ping_packet)
+                logger.info(f"[{self.addr}] [V25] Sent Server PING (Type 90) to activate connection!")
             
-            # Field 87: early handshake / token update
-            elif 87 in req:
-                logger.info(f"[{self.addr}] [V25] Field 87 token update received (req_id={req_id})")
-                resp = ProtobufMessage.build_envelope_response(101, b'', req_id=req_id, channel=channel)
-                self.sock.sendall(resp)
-                logger.info(f"[{self.addr}] [V25] Acknowledged Field 87 (Type 101, req_id={req_id})")
-            
-            # Login or game requests
-            elif any(f in req for f in [3, 21, 23, 24, 26]):
-                logger.info(f"[{self.addr}] [V25] LOGIN_REQUEST received (req_id={req_id})")
-                login_payload = ProtobufMessage.build_login_response(self.player_id, self.player_name, status=0)
-                resp = ProtobufMessage.build_envelope_response(118, login_payload, req_id=req_id, channel=channel)
+            # Field 1 or req_id 107: client replied with pong
+            elif 1 in req or req_id == 107:
+                logger.info(f"[{self.addr}] [V25] Client PONG (Type 107) received!")
+                login_payload = ProtobufMessage.build_v25_login_response(status=1)
+                resp = ProtobufMessage.build_envelope_response(118, login_payload, channel=channel)
                 self.sock.sendall(resp)
                 self.logged_in = True
-                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118, req_id={req_id})")
+                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118, Field 8)")
+            
+            # Field 87 or 90: ping -> reply with pong (Type 107)
+            elif 87 in req or 90 in req or req_id == 90:
+                logger.info(f"[{self.addr}] [V25] Field 87/90 ping received (req_id={req_id})")
+                pong_payload = ProtobufMessage.encode_tag(1, 2) + ProtobufMessage.encode_string("pong")
+                resp = ProtobufMessage.build_envelope_response(107, pong_payload, channel=channel)
+                self.sock.sendall(resp)
+                logger.info(f"[{self.addr}] [V25] Sent PONG (Type 107)")
+            
+            # Login or game requests
+            elif any(f in req for f in [3, 21, 23, 24, 26, 75]):
+                logger.info(f"[{self.addr}] [V25] LOGIN_REQUEST received (req_id={req_id})")
+                login_payload = ProtobufMessage.build_v25_login_response(status=0)
+                resp = ProtobufMessage.build_envelope_response(118, login_payload, channel=channel)
+                self.sock.sendall(resp)
+                self.logged_in = True
+                logger.info(f"[{self.addr}] [V25] Sent LOGIN_RESPONSE (Type 118)")
+
             
             else:
-                logger.info(f"[{self.addr}] [V25] Other request with fields {list(req.keys())}")
-                if req_id is not None:
-                    resp = ProtobufMessage.build_envelope_response(107, b'', req_id=req_id, channel=channel)
-                    self.sock.sendall(resp)
+                logger.info(f"[{self.addr}] [V25] Other request with fields {list(req.keys())}, req_id={req_id}")
+                for k, v in req.items():
+                    if isinstance(v, bytes):
+                        logger.info(f"[{self.addr}] [V25] Field {k} len={len(v)}: hex={v[:32].hex()}")
+                    else:
+                        logger.info(f"[{self.addr}] [V25] Field {k}: val={v}")
+                pong_payload = ProtobufMessage.encode_tag(1, 2) + ProtobufMessage.encode_string("pong")
+                resp = ProtobufMessage.build_envelope_response(107, pong_payload, channel=channel)
+                self.sock.sendall(resp)
         except Exception as e:
             logger.error(f"[{self.addr}] Error handling v25 envelope: {e}")
     
@@ -383,11 +489,13 @@ class ClientConnection:
     
     def close(self):
         """Close the connection"""
+        self.running = False
         try:
             self.sock.close()
         except:
             pass
         logger.info(f"[{self.addr}] Connection closed")
+
 
 
 class MobileGameServer:
